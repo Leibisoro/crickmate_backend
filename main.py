@@ -1,20 +1,26 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from passlib.context import CryptContext
 from database import get_connection
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import random, string, hashlib, time
+import json
+from typing import Dict, List
 
 app = FastAPI()
 
 # --- CORS middleware ---
+# --- CORS middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to your frontend URL in production
+    allow_origins=[
+        "https://crickmate-frontend.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- Password hashing ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -24,6 +30,45 @@ def get_password_hash(password: str):
 
 def verify_password(plain_password: str, hashed_password: str):
     return pwd_context.verify(plain_password, hashed_password)
+
+# --- WebSocket Room Manager ---
+class ConnectionManager:
+    def __init__(self):
+        # room_code -> list of WebSocket connections
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+        # room_code -> game state
+        self.game_states: Dict[str, dict] = {}
+
+    async def connect(self, websocket: WebSocket, room_code: str):
+        await websocket.accept()
+        if room_code not in self.active_connections:
+            self.active_connections[room_code] = []
+            self.game_states[room_code] = {
+                "players": [],
+                "toss": {},
+                "game_data": {}
+            }
+        self.active_connections[room_code].append(websocket)
+
+    def disconnect(self, websocket: WebSocket, room_code: str):
+        if room_code in self.active_connections:
+            self.active_connections[room_code].remove(websocket)
+            if len(self.active_connections[room_code]) == 0:
+                del self.active_connections[room_code]
+                del self.game_states[room_code]
+
+    async def send_to_room(self, room_code: str, message: dict):
+        if room_code in self.active_connections:
+            for connection in self.active_connections[room_code]:
+                try:
+                    await connection.send_json(message)
+                except:
+                    pass
+
+    def get_player_count(self, room_code: str) -> int:
+        return len(self.active_connections.get(room_code, []))
+
+manager = ConnectionManager()
 
 # --- Pydantic models ---
 class SignupRequest(BaseModel):
@@ -36,7 +81,7 @@ class LoginRequest(BaseModel):
 
 class RoomRequest(BaseModel):
     username: str
-    roomCode: str | None = None  # Optional for creating a room
+    roomCode: str | None = None
 
 # --- Root & DB Test ---
 @app.get("/")
@@ -143,6 +188,78 @@ def join_room(data: RoomRequest):
     finally:
         cur.close()
         conn.close()
+
+# --- WebSocket endpoint for multiplayer ---
+@app.websocket("/ws/multiplayer/{room_code}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str):
+    await manager.connect(websocket, room_code)
+    
+    try:
+        # Send player count on join
+        player_count = manager.get_player_count(room_code)
+        await manager.send_to_room(room_code, {
+            "type": "player_joined",
+            "player_count": player_count
+        })
+        
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            
+            # Handle different message types
+            if msg_type == "toss_choice":
+                # Player chose odd/even
+                await manager.send_to_room(room_code, {
+                    "type": "toss_choice",
+                    "player": data.get("player"),
+                    "choice": data.get("choice")
+                })
+                
+            elif msg_type == "toss_number":
+                # Player picked a number
+                await manager.send_to_room(room_code, {
+                    "type": "toss_number",
+                    "player": data.get("player"),
+                    "number": data.get("number")
+                })
+                
+            elif msg_type == "toss_result":
+                # Send toss result to both players
+                await manager.send_to_room(room_code, {
+                    "type": "toss_result",
+                    "winner": data.get("winner"),
+                    "player1_number": data.get("player1_number"),
+                    "player2_number": data.get("player2_number")
+                })
+                
+            elif msg_type == "bat_bowl_choice":
+                # Winner chose to bat or bowl
+                await manager.send_to_room(room_code, {
+                    "type": "bat_bowl_choice",
+                    "player": data.get("player"),
+                    "choice": data.get("choice")
+                })
+                
+            elif msg_type == "game_action":
+                # In-game actions (batting, bowling, etc.)
+                await manager.send_to_room(room_code, {
+                    "type": "game_action",
+                    "action": data.get("action"),
+                    "data": data.get("data")
+                })
+                
+            else:
+                # Echo any other messages
+                await manager.send_to_room(room_code, data)
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, room_code)
+        player_count = manager.get_player_count(room_code)
+        if player_count > 0:
+            await manager.send_to_room(room_code, {
+                "type": "player_left",
+                "player_count": player_count
+            })
 
 # --- Leaderboard API with blockchain hash ---
 @app.get("/leaderboard")
